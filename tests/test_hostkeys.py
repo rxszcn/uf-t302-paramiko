@@ -167,3 +167,237 @@ class HostKeysTabsTest(HostKeysTest):
     def setUp(self):
         with open("hostfile.temp", "w") as f:
             f.write(test_hosts_file_tabs)
+
+
+# @cert-authority / @revoked coverage.  The four input shapes below are the
+# test matrix: plain lines only, wildcard cert-authority, revoked, and hashed
+# host names carrying markers.
+_HASH_SALT = "BMsIC6cUIP2zBuXR3t2LRcJYjzM="
+
+_plain_lines = {
+    line.split(" ")[0]: line for line in test_hosts_file.splitlines() if line
+}
+
+
+def _marker_line(marker, hostnames, source_line):
+    """Re-use the key data of ``source_line`` under a marker and new names."""
+    _, key_type, key_data = source_line.split(" ")
+    return "@{} {} {} {}".format(marker, hostnames, key_type, key_data)
+
+
+_cert_wildcard_line = _marker_line(
+    "cert-authority", "*.corp.example.com", _plain_lines["modern.example.com"]
+)
+_cert_hashed_line = _marker_line(
+    "cert-authority",
+    paramiko.HostKeys.hash_host("builder.example.com", _HASH_SALT),
+    _plain_lines["curvy.example.com"],
+)
+_revoked_plain_line = _marker_line(
+    "revoked", "revoked.example.com", _plain_lines["happy.example.com"]
+)
+_revoked_hashed_line = _marker_line(
+    "revoked",
+    paramiko.HostKeys.hash_host("revoked.example.com", _HASH_SALT),
+    _plain_lines["happy.example.com"],
+)
+
+# A mixed file in which marker lines sit in the middle: if loading aborted at
+# a marker line, every plain line below it would be missing.
+test_hosts_file_markers = "\n".join(
+    [
+        _plain_lines["secure.example.com"],
+        _cert_wildcard_line,
+        _plain_lines["happy.example.com"],
+        _revoked_plain_line,
+        _cert_hashed_line,
+        _revoked_hashed_line,
+        _plain_lines["curvy.example.com"],
+    ]
+)
+
+
+class HostKeysMarkersTest(unittest.TestCase):
+    filename = "hostfile.markers.temp"
+
+    def setUp(self):
+        with open(self.filename, "w") as f:
+            f.write(test_hosts_file_markers)
+
+    def tearDown(self):
+        os.unlink(self.filename)
+
+    def _load_text(self, text):
+        with open(self.filename, "w") as f:
+            f.write(text)
+        return paramiko.HostKeys(self.filename)
+
+    def test_plain_lines_keep_existing_readings(self):
+        # Matrix group 1: plain lines only, unchanged behaviour.
+        hostdict = self._load_text(test_hosts_file)
+        assert len(hostdict) == 4
+        for host in (
+            "secure.example.com",
+            "happy.example.com",
+            "modern.example.com",
+            "curvy.example.com",
+        ):
+            entry = hostdict.lookup(host)
+            self.assertIsNotNone(entry)
+            self.assertNotIn("revoked", entry.markers.values())
+            self.assertFalse(hostdict.is_revoked(host))
+        self.assertTrue(
+            hostdict.check(
+                "happy.example.com",
+                paramiko.RSAKey(data=decodebytes(keyblob)),
+            )
+        )
+        self.assertEqual(hostdict.revoked_keys(), [])
+
+    def test_mixed_file_loads_through_marker_lines(self):
+        hostdict = paramiko.HostKeys(self.filename)
+        # 5 offerable host names: revoked ones stay out of the mapping.
+        assert len(hostdict) == 5
+        # Plain lines before and after the marker lines are all effective.
+        for host in (
+            "secure.example.com",
+            "happy.example.com",
+            "curvy.example.com",
+        ):
+            entry = hostdict.lookup(host)
+            self.assertIsNotNone(entry, host)
+            self.assertTrue(hostdict.check(host, entry[entry.keys()[0]]))
+        # The last line of the file took effect.
+        self.assertIsNotNone(hostdict["curvy.example.com"])
+
+    def test_cert_authority_wildcard_is_queryable(self):
+        # Matrix group 2: wildcard CA trust-anchor line.
+        hostdict = paramiko.HostKeys(self.filename)
+        entry = hostdict.lookup("node7.corp.example.com")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.markers, {"ssh-ed25519": "cert-authority"})
+        self.assertIn("ssh-ed25519", entry.keys())
+        # Trust-anchor lines are not "revoked" merely because they are markers.
+        self.assertFalse(hostdict.is_revoked("node7.corp.example.com"))
+        # A host matching no line is still unknown.
+        self.assertIsNone(hostdict.lookup("node7.other.example.com"))
+
+    def test_revoked_is_distinguishable_from_unknown(self):
+        # Matrix group 3: revoked line.
+        hostdict = paramiko.HostKeys(self.filename)
+        revoked_key = paramiko.RSAKey(data=decodebytes(keyblob))
+        self.assertIsNone(hostdict.lookup("revoked.example.com"))
+        self.assertTrue(hostdict.is_revoked("revoked.example.com"))
+        self.assertFalse(hostdict.check("revoked.example.com", revoked_key))
+        self.assertIn("revoked.example.com", hostdict.revoked_keys())
+        # Unknown host: no entry, and not revoked either.
+        self.assertIsNone(hostdict.lookup("nowhere.example.com"))
+        self.assertFalse(hostdict.is_revoked("nowhere.example.com"))
+
+    def test_hashed_marker_lines_match_plain_name_readings(self):
+        # Matrix group 4: markers on |1| hashed host names behave the same as
+        # the plain-name forms (same key type offered, same marker recorded).
+        hostdict = paramiko.HostKeys(self.filename)
+        hashed_cert = hostdict.lookup("builder.example.com")
+        self.assertIsNotNone(hashed_cert)
+        self.assertEqual(
+            hashed_cert.markers, {"ecdsa-sha2-nistp256": "cert-authority"}
+        )
+        plain_cert = self._load_text(
+            _marker_line(
+                "cert-authority",
+                "builder.example.com",
+                _plain_lines["curvy.example.com"],
+            )
+        ).lookup("builder.example.com")
+        self.assertIsNotNone(plain_cert)
+        self.assertEqual(
+            list(hashed_cert.markers.values()),
+            list(plain_cert.markers.values()),
+        )
+        self.assertEqual(hashed_cert.keys(), plain_cert.keys())
+
+        # Revoked hashed line: same verdict as the plain revoked line.
+        self.assertTrue(hostdict.is_revoked("revoked.example.com"))
+        self.assertIsNone(hostdict.lookup("revoked.example.com"))
+
+    def test_revoked_key_rejected_even_with_plain_entry(self):
+        hostdict = self._load_text(
+            "{}\n{}\n".format(
+                _plain_lines["happy.example.com"],
+                _marker_line(
+                    "revoked",
+                    "happy.example.com",
+                    _plain_lines["happy.example.com"],
+                ),
+            )
+        )
+        key = paramiko.RSAKey(data=decodebytes(keyblob))
+        self.assertFalse(hostdict.check("happy.example.com", key))
+        self.assertTrue(hostdict.is_revoked("happy.example.com"))
+
+    def test_unknown_marker_and_invalid_lines_are_skipped(self):
+        text = "\n".join(
+            [
+                "@unsupported-marker ghost.example.com ssh-rsa AAAA",
+                "broken.example.com ssh-rsa AAAA",
+                _plain_lines["secure.example.com"],
+            ]
+        )
+        hostdict = self._load_text(text)
+        assert len(hostdict) == 1
+        self.assertIsNotNone(hostdict.lookup("secure.example.com"))
+        self.assertIsNone(hostdict.lookup("ghost.example.com"))
+
+    def test_entry_to_line_keeps_marker(self):
+        for line in (
+            _cert_wildcard_line,
+            _revoked_plain_line,
+            _cert_hashed_line,
+            _revoked_hashed_line,
+        ):
+            entry = paramiko.hostkeys.HostKeyEntry.from_line(line)
+            self.assertEqual(entry.to_line().strip(), line)
+        plain = paramiko.hostkeys.HostKeyEntry.from_line(
+            _plain_lines["secure.example.com"]
+        )
+        self.assertIsNone(plain.marker)
+        self.assertEqual(
+            plain.to_line().strip(), _plain_lines["secure.example.com"]
+        )
+
+    def test_save_after_add_keeps_marker_lines(self):
+        # Mirrors AutoAddPolicy: add the unknown host, then archive the whole
+        # file back out, then feed it to the next round.
+        hostdict = paramiko.HostKeys(self.filename)
+        new_key = paramiko.RSAKey(data=decodebytes(keyblob))
+        hostdict.add("new.example.com", "ssh-rsa", new_key)
+        hostdict.save(self.filename)
+
+        with open(self.filename) as f:
+            written = [line.strip() for line in f if line.strip()]
+
+        original = test_hosts_file_markers.splitlines()
+        self.assertEqual(written[:-1], original)
+        self.assertEqual(
+            written[-1],
+            "new.example.com ssh-rsa {}".format(new_key.get_base64()),
+        )
+
+        reloaded = paramiko.HostKeys(self.filename)
+        self.assertIsNotNone(reloaded.lookup("new.example.com"))
+        self.assertTrue(reloaded.is_revoked("revoked.example.com"))
+        self.assertEqual(
+            reloaded.lookup("node7.corp.example.com").markers,
+            {"ssh-ed25519": "cert-authority"},
+        )
+        self.assertIsNone(reloaded.lookup("revoked.example.com"))
+
+    def test_sshclient_entry_loads_mixed_file(self):
+        client = paramiko.SSHClient()
+        client.load_host_keys(self.filename)
+        keys = client.get_host_keys()
+        self.assertIsNotNone(keys.lookup("secure.example.com"))
+        self.assertIsNotNone(keys.lookup("node7.corp.example.com"))
+        self.assertTrue(keys.is_revoked("revoked.example.com"))
+        self.assertIsNone(keys.lookup("revoked.example.com"))
